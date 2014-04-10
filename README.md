@@ -7,7 +7,7 @@ A Clojure core.async wrapper around the excellent [NuProcess library by Brett Wo
 Add the following dependency to your `project.clj` file
 
 ```clojure
-[asynp "0.0.2"]
+[asynp "0.0.3"]
 ```
 
 ## Usage
