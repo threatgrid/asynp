@@ -1,4 +1,4 @@
-(defproject asynp "0.0.2"
+(defproject asynp "0.0.3-SNAPSHOT"
   :description "A core.async library for efficient subprocess management"
   :url "http://github.com/threatgrid/asynp"
   :license {:name "Eclipse Public License"
