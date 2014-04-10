@@ -7,7 +7,20 @@
            [java.nio.charset Charset CoderResult]
            [java.util.regex Pattern]))
 
-(def ^:dynamic *working-buffer-size* 1024)
+(defmacro go-ex [& body]
+  `(go
+     (try
+       ~@body
+       (catch Exception e
+         (timbre/error e)))))
+
+(def ^:dynamic *working-buffer-size*
+  "Initial size of the destination buffer for reads. Will be reallocated with a larger size as-needed."
+  1024)
+
+(def ^:dynamic *callback-timeout-ms*
+  "Maximum number of milliseconds to block in NuProcess callback thread before timing out and failing loudly. Serves as a failsafe for cases where channel readers are hung or not present. Set to nil to disable timeout."
+  30000)
 
 (defn array-from-buffer [^ByteBuffer buffer]
   "Given a ByteBuffer, return an array of bytes"
@@ -16,19 +29,43 @@
     (.get buffer dest)
     dest))
 
-(defn run-process [argv]
+(defn run-process [argv & {:keys [shutdown-chan]}]
   "Run a process with the given argv, and return a dictionary with access to the process object itself and channels for controlling it.
 
-  Returns a dictionary with the following keys:
-    :process - a NuProcess object
-    :in - an unbuffered channel used for input. Contents will be streamed to the process's stdin.
-    :out - an unbuffered channel used for output. Contains contents read from the process's stdout.
-    :err - an unbuffered channel used for output. Contains contents read from the process's stderr.
-    :exit - a buffered channel used for output. Empty until process has exited. Contains exit status, or INT_MIN if process was not successfully invoked.
+  Accepts the following optional keyword arguments:
+  - `shutdown-chan`: use a preexisting channel to force shutdown
 
-  All objects on the :in, :out or :err channels should be ByteBuffer instances positioned for reading."
-  (let [in-chan (chan), out-chan (chan), err-chan (chan), exit-chan (chan 1)
-        process-atom (atom nil)]
+  Returns a dictionary with the following keys:
+  - `:process` - a NuProcess object
+  - `:in` - an unbuffered channel used for input. Contents will be streamed to the process's stdin.
+  - `:out` - an unbuffered channel used for output. Contains contents read from the process's stdout.
+  - `:err` - an unbuffered channel used for output. Contains contents read from the process's stderr.
+  - `:exit` - a buffered channel used for output. Empty until process has exited. Contains exit status, or INT_MIN if process was not successfully invoked.
+  - `:shutdown` - an unbuffered channel used for input. Closing this channel will force the process to exit.
+
+  All objects on the :in, :out or :err channels will be byte arrays."
+  (let [in-chan (chan), out-chan (chan), err-chan (chan), exit-status-chan (chan 1)
+        shutdown-chan (or shutdown-chan (chan))
+        process-atom (atom nil)
+        write-callback (fn [^ByteBuffer buffer, dest-chan, dest-name]
+                         (when buffer
+                           (timbre/trace "In callback")
+                           (let [channels [[dest-chan (array-from-buffer buffer)] shutdown-chan]
+                                 [v c] (alts!! (if *callback-timeout-ms*
+                                                 (conj channels (timeout *callback-timeout-ms*))
+                                                 channels))]
+                             (timbre/trace "callback write result: " v "," c)
+                             (cond
+                              (= c dest-chan)
+                              (timbre/trace "successful write to" dest-name)
+
+                              (= c shutdown-chan)
+                              (timbre/trace "write to" dest-name "interrupted by shutdown")
+
+                              :else
+                              (do
+                                (timbre/error "timeout occurred in callback writing to" dest-name "-- shutting down")
+                                (let [^NuProcess p @process-atom] (.destroy p)))))))]
     (let [^NuProcessHandler handler
           (proxy [NuProcessHandler] []
             (onStart [process]
@@ -36,18 +73,18 @@
               (reset! process-atom process))
             (onExit [statusCode]
               (timbre/trace "onExit called with" statusCode)
-              (>!! exit-chan statusCode)
+              (>!! exit-status-chan statusCode)
               (close! out-chan)
               (close! err-chan)
-              (close! exit-chan))
+              (close! exit-status-chan))
             (onStdout [^ByteBuffer buffer]
               (timbre/trace "onStdout called with" buffer)
-              (when buffer
-                (>!! out-chan buffer)))
+              (write-callback buffer out-chan :out)
+              (timbre/trace "onStdout finished; buffer no longer safe"))
             (onStderr [^ByteBuffer buffer]
               (timbre/trace "onStderr called with" buffer)
-              (when buffer
-                (>!! err-chan buffer)))
+              (write-callback buffer err-chan :err)
+              (timbre/trace "onStderr finished; buffer no longer safe"))
             (onStdinReady [^ByteBuffer buffer]
               (timbre/trace "Performing deferred close")
               (let [^NuProcess process @process-atom]
@@ -56,36 +93,42 @@
           ^java.util.List argv-list (apply list argv)
           builder (NuProcessBuilder. handler argv-list)]
       (let [process (.start builder)]
-        (go
+        (go-ex
           (loop []
-            (let [^bytes content (<! in-chan)]
-              (if content
-                (do
-                  (timbre/trace "Writing" (alength ^bytes content) "bytes to process")
-                  (.writeStdin process (ByteBuffer/wrap content))
-                  (recur))
-                (do
-                  (timbre/trace "stdin stream ended; telling NuProcess to callback after flush")
-                  (.wantWrite process))))))
+            (let [[v c] (alts! [in-chan shutdown-chan])]
+              (cond
+               (= c in-chan)
+               (if v
+                 (do
+                   (timbre/trace "Writing" (alength ^bytes v) "bytes to process")
+                   (.writeStdin process (ByteBuffer/wrap v))
+                   (recur))
+                 (do
+                   (timbre/trace "stdin stream ended; telling NuProcess to callback after flush")
+                   (.wantWrite process)))
+
+               :else
+               (timbre/trace "shutdown chan triggered; ending input goroutine")))))
         {:process process
          :in in-chan
          :out out-chan
          :err err-chan
-         :exit exit-chan}))))
+         :exit exit-status-chan
+         :shutdown shutdown-chan}))))
 
 (defn decode-chars
-  "given a stream of ByteBuffers, emit a stream of CharBuffers"
+  "given a stream of byte arrays, emit a stream of CharBuffers"
   ([in-chan]
      (decode-chars in-chan (Charset/forName "utf8")))
   ([in-chan, ^Charset charset]
      (let [out-chan (chan)
            decoder (.newDecoder charset)]
-       (go
+       (go-ex
          (loop [^ByteBuffer working-buffer (ByteBuffer/allocate *working-buffer-size*) ; compacted and ready to receive writes
-                ^ByteBuffer in-buffer (<! in-chan)]
-           (timbre/trace "decoder: starting loop with working buffer " working-buffer " processing content " in-buffer)
+                ^bytes in-bytes (<! in-chan)]
+           (timbre/trace "decoder: starting loop with working buffer " working-buffer " processing content " in-bytes)
            (cond
-            (nil? in-buffer)
+            (nil? in-bytes)
             (do
               (.flip ^ByteBuffer working-buffer) ; use as a source
               (timbre/trace "decoder: end of input stream seen; flushing the rest of " working-buffer)
@@ -99,23 +142,24 @@
                 (close! out-chan))
               nil)
 
-            (< (.remaining ^ByteBuffer working-buffer) (.remaining ^ByteBuffer in-buffer))
+            (< (.remaining ^ByteBuffer working-buffer) (alength ^bytes in-bytes))
             (do
-              (timbre/trace "decoder: resizing working buffer (" (.remaining ^ByteBuffer working-buffer)
-                            " bytes left of " (.remaining ^ByteBuffer in-buffer) "needed")
+              (timbre/trace "decoder: resizing working buffer;" (.remaining ^ByteBuffer working-buffer)
+                            "bytes left of" (alength ^bytes in-bytes) "needed")
               (let [new-working-buffer (ByteBuffer/allocate (+ *working-buffer-size*
                                                                (.capacity ^ByteBuffer working-buffer)
-                                                               (.remaining ^ByteBuffer in-buffer)))]
+                                                               (alength ^bytes in-bytes)))]
                 (.flip ^ByteBuffer working-buffer) ; use as a source for copy
                 (.put ^ByteBuffer new-working-buffer ^ByteBuffer working-buffer)
-                (recur new-working-buffer in-buffer)))
+                (recur new-working-buffer in-bytes)))
 
             :else
             (do
-              (timbre/trace "decoder: running a regular cycle; in-buffer " in-buffer ", working-buffer " working-buffer)
-              (.put ^ByteBuffer working-buffer ^ByteBuffer in-buffer)
+              (timbre/trace "decoder: running a regular cycle; in-bytes " in-bytes ", working-buffer " working-buffer)
+              (.put ^ByteBuffer working-buffer ^bytes in-bytes)
               (.flip ^ByteBuffer working-buffer) ; use a source for decoding
-              (timbre/trace "Trying to decode working-buffer: " working-buffer)
+              (timbre/trace "working-buffer" working-buffer "populated for decode:"
+                            (seq (array-from-buffer (.duplicate ^ByteBuffer working-buffer))))
               (let [out-buffer (CharBuffer/allocate (.remaining ^ByteBuffer working-buffer))
                     decode-result (.decode decoder ^ByteBuffer working-buffer ^CharBuffer out-buffer false)]
                 (timbre/trace "Decoding into" out-buffer
@@ -208,7 +252,14 @@
   ([proc-dict]
      (<!! (:exit proc-dict)))
   ([proc-dict timeout-ms]
-     (let [exit-chan {:exit proc-dict}
-           [c v] (alts!! [exit-chan (timeout timeout-ms)])]
+     (let [exit-chan (:exit proc-dict)
+           [v c] (alts!! [exit-chan (timeout timeout-ms)])]
        (when (= c exit-chan)
          v))))
+
+(defn shutdown-process
+  "Force process to shut down immediately by closing its shutdown channel.
+
+  Note that this can have side effects if an external (shared) shutdown channel was supplied rather than allowing a new one to be created by default."
+  [proc-dict]
+  (close! (:shutdown proc-dict)))

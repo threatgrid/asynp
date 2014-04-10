@@ -15,7 +15,9 @@ Add the following dependency to your `project.clj` file
 The following is a roughly complete demonstration of features and usage:
 
 ```clojure
-(require '[asynp.core :refer [run-process log-strings decode-chars write-str-to-process close-stdin-for-process wait-for-process]])
+(require '[asynp.core :refer [run-process wait-for-process shutdown-process
+                              close-stdin-for-process  write-str-to-process
+                              log-strings decode-chars]])
 (let [process-dict (run-process ["/bin/cat"])]
 
   ;; set up readers for stderr and stdout
@@ -30,8 +32,9 @@ The following is a roughly complete demonstration of features and usage:
   ;; close stdin
   (close-stdin-for-process process-dict)
 
-  ;; wait for the process to exit (optional)
-  (wait-for-process process-dict))
+  ;; wait for 5 seconds for the process to exit, then force a shutdown
+  (println (str "Exit status: " (wait-for-process process-dict 5000)))
+  (shutdown-process process-dict))
 ```
 
 ## License
