@@ -4,6 +4,7 @@
   :license {:name "Eclipse Public License"
             :url "http://www.eclipse.org/legal/epl-v10.html"}
   :scm {:name "git" :url "https://github.com/threatgrid/asynp"}
+  :plugins [[codox "0.6.7"]]
   :dependencies [[org.clojure/clojure "1.5.1"]
                  [org.clojure/core.async "0.1.278.0-76b25b-alpha"]
                  [com.taoensso/timbre "3.1.6"]
