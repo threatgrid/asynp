@@ -6,13 +6,15 @@ A Clojure core.async wrapper around the excellent [NuProcess library by Brett Wo
 
 Add the following dependency to your `project.clj` file
 
-    [asynp "0.0.1"]
+```clojure
+[asynp "0.0.2"]
+```
 
 ## Usage
 
 The following is a roughly complete demonstration of features and usage:
 
-```
+```clojure
 (require '[asynp.core :refer [run-process log-strings decode-chars write-str-to-process close-stdin-for-process wait-for-process]])
 (let [process-dict (run-process ["/bin/cat"])]
 
